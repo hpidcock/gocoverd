@@ -10,7 +10,7 @@ base: core24
 confinement: strict
 
 apps:
-  coverd:
+  gocoverd:
     command: bin/gocoverd
     plugs:
       - network
@@ -18,9 +18,11 @@ apps:
     daemon: simple
 
 parts:
-  coverd:
+  gocoverd:
     plugin: go
     source-type: git
     source: https://github.com/hpidcock/gocoverd
-    stage-packages:
-      - go/1.24
+    build-snaps:
+      - go/latest/stable
+    stage-snaps:
+      - go/latest/stable

@@ -5,6 +5,8 @@ import (
 	"flag"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -17,14 +19,29 @@ func main() {
 	var dataDir string
 	var httpListenAddr string
 	var tlsAutocertDomain string
-	flag.StringVar(&dataDir, "data-dir", "", "Directory containing coverage data")
-	flag.StringVar(&httpListenAddr, "http-listen", "", "Address to listen on")
-	flag.StringVar(&tlsAutocertDomain, "tls-autocert-domain", "", "Domain to use for TLS autocert")
-	flag.Parse()
+	if os.Getenv("SNAP_NAME") == "gocoverd" {
+		dataDir = os.ExpandEnv("$SNAP_COMMON/data")
+		err = os.MkdirAll(dataDir, 0755)
+		if err != nil {
+			panic(err)
+		}
+		httpListenAddr, err = getSnapOption("http-listen")
+		if err != nil {
+			panic(err)
+		}
+		tlsAutocertDomain, err = getSnapOption("tls-autocert-domain")
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		flag.StringVar(&dataDir, "data-dir", "", "Directory containing coverage data")
+		flag.StringVar(&httpListenAddr, "http-listen", "", "Address to listen on")
+		flag.StringVar(&tlsAutocertDomain, "tls-autocert-domain", "", "Domain to use for TLS autocert")
+		flag.Parse()
+	}
 	if dataDir == "" {
 		panic("data-dir flag is required")
 	}
-
 	if httpListenAddr == "" && tlsAutocertDomain == "" {
 		panic("either http-listen or tls-autocert-domain must be specified")
 	}
@@ -75,4 +92,13 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func getSnapOption(opt string) (string, error) {
+	cmd := exec.Command("snapctl", "get", opt, "-d")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
