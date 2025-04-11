@@ -1,0 +1,26 @@
+name: gocoverd
+summary: a daemon for collecting go covdata
+description: |
+  A http/https daemon for collecting go covdata from distributed systems
+  that upload tar gzipped covdata meta and profile data.
+version: git
+grade: stable
+base: core24
+
+confinement: strict
+
+apps:
+  coverd:
+    command: bin/gocoverd
+    plugs:
+      - network
+      - network-bind
+    daemon: simple
+
+parts:
+  coverd:
+    plugin: go
+    source-type: git
+    source: https://github.com/hpidcock/gocoverd
+    stage-packages:
+      - go/1.24
