@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +22,7 @@ func main() {
 	var dataDir string
 	var httpListenAddr string
 	var tlsAutocertDomain string
+	var psk string
 	if os.Getenv("SNAP_NAME") == "gocoverd" {
 		dataDir = os.ExpandEnv("$SNAP_COMMON/data")
 		err = os.MkdirAll(dataDir, 0755)
@@ -34,10 +37,15 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
+		psk, err = getSnapOption("presharedkey")
+		if err != nil {
+			panic(err)
+		}
 	} else {
 		flag.StringVar(&dataDir, "data-dir", "", "Directory containing coverage data")
 		flag.StringVar(&httpListenAddr, "http-listen", "", "Address to listen on")
 		flag.StringVar(&tlsAutocertDomain, "tls-autocert-domain", "", "Domain to use for TLS autocert")
+		flag.StringVar(&psk, "presharedkey", "", "PSK for HMAC SHA256 auth")
 		flag.Parse()
 	}
 	if dataDir == "" {
@@ -49,10 +57,14 @@ func main() {
 	if httpListenAddr != "" && tlsAutocertDomain != "" {
 		panic("only one of http-listen or tls-autocert-domain can be specified")
 	}
+	if psk == "" {
+		psk = rand.Text()
+		log.Printf("presharedkey=%s", psk)
+	}
 
 	eg, ctx := errgroup.WithContext(context.Background())
 
-	s := newServer(dataDir)
+	s := newServer(dataDir, []byte(psk))
 
 	httpServer := &http.Server{
 		Handler: s.Handler(),

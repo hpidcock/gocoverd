@@ -2,8 +2,12 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +26,7 @@ import (
 )
 
 type server struct {
+	psk       []byte
 	dataDir   string
 	dataDirFS fs.FS
 
@@ -32,10 +37,11 @@ type server struct {
 	closedChan <-chan struct{}
 }
 
-func newServer(dataDir string) *server {
+func newServer(dataDir string, psk []byte) *server {
 	closedChan := make(chan struct{})
 	close(closedChan)
 	return &server{
+		psk:             psk,
 		dataDir:         dataDir,
 		dataDirFS:       os.DirFS(dataDir),
 		writingProfiles: make(map[uuid.UUID]chan struct{}),
@@ -73,7 +79,65 @@ func (s *server) Handler() http.Handler {
 	r := mux.NewRouter()
 	r.Path("/{namespace}/covdata").Methods(http.MethodPut).HandlerFunc(s.HandleUpload)
 	r.Path("/{namespace}/covdata").Methods(http.MethodGet).HandlerFunc(s.HandleDownload)
+	r.Path("/{namespace}").Methods(http.MethodPut).HandlerFunc(s.HandleCreate)
 	return r
+}
+
+const maxInfoLength = 256
+
+func (s *server) HandleCreate(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	namespace := vars["namespace"]
+	if !isSHA256(namespace) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if r.ContentLength < 1 || r.ContentLength > maxInfoLength {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	buffer := &bytes.Buffer{}
+	m := hmac.New(sha256.New, s.psk)
+	written, err := io.Copy(m, io.TeeReader(io.LimitReader(r.Body, r.ContentLength), buffer))
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if written != r.ContentLength {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	namespaceBytes, err := hex.DecodeString(namespace)
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	mac := m.Sum(nil)
+	if !bytes.Equal(mac, namespaceBytes) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	dir := path.Join(s.dataDir, namespace)
+	err = os.Mkdir(dir, 0755)
+	if errors.Is(err, os.ErrExist) {
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	info := path.Join(dir, "info")
+	err = os.WriteFile(info, buffer.Bytes(), 0644)
+	if errors.Is(err, os.ErrExist) {
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	http.Error(w, "OK", http.StatusOK)
 }
 
 func (s *server) HandleUpload(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +145,7 @@ func (s *server) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	namespace := vars["namespace"]
 	namespaceDir, err := checkNamespace(s.dataDirFS, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -159,7 +223,7 @@ func (s *server) HandleDownload(w http.ResponseWriter, r *http.Request) {
 	namespace := vars["namespace"]
 	namespaceDir, err := checkNamespace(s.dataDirFS, namespace)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	dir := path.Join(s.dataDir, namespaceDir)
