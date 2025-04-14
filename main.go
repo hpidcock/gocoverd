@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"net"
 	"net/http"
@@ -100,5 +101,10 @@ func getSnapOption(opt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(out), nil
+	config := map[string]string{}
+	err = json.Unmarshal(out, config)
+	if err != nil {
+		return "", err
+	}
+	return config[opt], nil
 }
