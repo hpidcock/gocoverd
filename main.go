@@ -102,7 +102,7 @@ func getSnapOption(opt string) (string, error) {
 		return "", err
 	}
 	config := map[string]string{}
-	err = json.Unmarshal(out, config)
+	err = json.Unmarshal(out, &config)
 	if err != nil {
 		return "", err
 	}
