@@ -5,3 +5,4 @@ go.work.sum
 .env
 *.snap
 snapcraft-*.txt
+_data

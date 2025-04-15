@@ -23,12 +23,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"golang.org/x/sync/errgroup"
 )
 
 type server struct {
 	psk       []byte
 	dataDir   string
 	dataDirFS fs.FS
+
+	cleanupMut sync.Mutex
 
 	mut             sync.Mutex
 	writingProfiles map[uuid.UUID]chan struct{}
@@ -228,57 +231,19 @@ func (s *server) HandleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := path.Join(s.dataDir, namespaceDir)
 
-	s.mut.Lock()
-	entries, err := os.ReadDir(dir)
-	s.mut.Unlock()
+	s.cleanupMut.Lock()
+	defer s.cleanupMut.Unlock()
+	result, err := s.compactNamespace(context.Background(), namespace, dir, true)
 	if err != nil {
-		log.Printf("failed to read directory %q: %v", dir, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	subDirectories := []string{}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		id, err := uuid.Parse(name)
-		if err != nil {
-			log.Printf("failed to parse UUID from directory name %q: %v", name, err)
-			continue
-		}
-		select {
-		case <-s.reading(namespace, id):
-		case <-r.Context().Done():
-			http.Error(w, "request cancelled", http.StatusRequestTimeout)
-			return
-		}
-		subDirectories = append(subDirectories, name)
-	}
-	if len(subDirectories) == 0 {
+	if result == "" {
 		log.Printf("no coverage data found")
 		http.Error(w, "no coverage data found", http.StatusNotFound)
 		return
 	}
-
-	tempDir, err := os.MkdirTemp("", "mergedcovdata*")
-	if err != nil {
-		log.Printf("failed to create temporary directory: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer os.RemoveAll(tempDir)
-
-	cmd := exec.CommandContext(r.Context(), "go", "tool", "covdata", "merge", "-i="+strings.Join(subDirectories, ","), "-o="+tempDir, "-pcombine")
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		log.Printf("failed to merge coverage data: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	resultDir := path.Join(dir, result)
 
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.Header().Set("Content-Disposition", "attachment; filename=mergedcovdata.tar.gz")
@@ -287,7 +252,7 @@ func (s *server) HandleDownload(w http.ResponseWriter, r *http.Request) {
 	defer gzw.Close()
 	tw := tar.NewWriter(gzw)
 	defer tw.Close()
-	err = tw.AddFS(os.DirFS(tempDir))
+	err = tw.AddFS(os.DirFS(resultDir))
 	if err != nil {
 		log.Printf("failed to add directory to tar: %v", err)
 		return
@@ -313,20 +278,30 @@ func (s *server) CompactNamespace(ctx context.Context, namespace string) error {
 	}
 	dir := path.Join(s.dataDir, namespaceDir)
 
+	s.cleanupMut.Lock()
+	defer s.cleanupMut.Unlock()
+	_, err = s.compactNamespace(ctx, namespace, dir, false)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *server) compactNamespace(ctx context.Context, namespace string, dir string, force bool) (string, error) {
 	s.mut.Lock()
 	compactNeeded := s.needsCompact[namespace]
 	delete(s.needsCompact, namespace)
-	if !compactNeeded {
+	if !force && !compactNeeded {
 		s.mut.Unlock()
-		return nil
+		return "", nil
 	}
 	entries, err := os.ReadDir(dir)
 	s.mut.Unlock()
 	if err != nil {
-		return fmt.Errorf("failed to read directory: %w", err)
+		return "", fmt.Errorf("failed to read directory: %w", err)
 	}
 
-	subDirectories := []string{}
+	profileDirs := []string{}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -339,50 +314,104 @@ func (s *server) CompactNamespace(ctx context.Context, namespace string) error {
 		select {
 		case <-s.reading(namespace, id):
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 		unlock := s.writing("", id)
 		defer unlock()
-		subDirectories = append(subDirectories, name)
+		profileDirs = append(profileDirs, name)
 	}
-	if len(subDirectories) == 0 {
-		return nil
+	if len(profileDirs) == 0 {
+		return "", nil
+	}
+	if len(profileDirs) == 1 {
+		return profileDirs[0], nil
+	}
+
+	result, err := s.compact(ctx, dir, profileDirs)
+	if err != nil {
+		return "", fmt.Errorf("failed to compact namespace %q: %w", namespace, err)
+	}
+
+	log.Printf("compacted %d profiles in namespace %q into %s", len(profileDirs), namespace, result)
+	return result, nil
+}
+
+const jobBranchNum = 8
+const maxProfilesPerJob = 64
+
+func (s *server) compact(ctx context.Context, dir string, profileDirs []string) (string, error) {
+	if len(profileDirs) == 0 {
+		return "", nil
+	}
+	if len(profileDirs) > maxProfilesPerJob {
+		jobsPerBranch := len(profileDirs) / jobBranchNum
+		groups := [jobBranchNum][]string{}
+		for i := range groups {
+			if i == jobBranchNum-1 {
+				groups[i] = profileDirs
+			} else {
+				groups[i] = profileDirs[:jobsPerBranch]
+				profileDirs = profileDirs[jobsPerBranch:]
+			}
+		}
+
+		results := [jobBranchNum]string{}
+		eg, egCtx := errgroup.WithContext(ctx)
+		for i := range groups {
+			eg.Go(func() error {
+				var err error
+				results[i], err = s.compact(egCtx, dir, groups[i])
+				return err
+			})
+		}
+
+		err := eg.Wait()
+		if err != nil {
+			return "", err
+		}
+
+		profileDirs = []string{}
+		for _, v := range results {
+			if v != "" {
+				profileDirs = append(profileDirs, v)
+			}
+		}
 	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	unlock := s.writing("", id)
 	defer unlock()
 
-	outDir := path.Join(s.dataDir, namespaceDir, id.String())
+	outDir := path.Join(dir, id.String())
 	err = os.Mkdir(outDir, 0755)
 	if err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
+		return "", fmt.Errorf("failed to create directory: %w", err)
 	}
 	if !path.IsAbs(outDir) {
 		wd, err := os.Getwd()
 		if err != nil {
-			return err
+			return "", err
 		}
 		outDir = path.Join(wd, outDir)
 	}
 
-	cmd := exec.CommandContext(ctx, "go", "tool", "covdata", "merge", "-i="+strings.Join(subDirectories, ","), "-o="+outDir, "-pcombine")
+	cmd := exec.CommandContext(ctx, "go", "tool", "covdata", "merge", "-i="+strings.Join(profileDirs, ","), "-o="+outDir, "-pcombine")
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
 		os.RemoveAll(outDir)
-		return fmt.Errorf("failed to merge coverage data: %w", err)
+		return "", fmt.Errorf("failed to merge coverage data: %w", err)
 	}
 
 	s.mut.Lock()
 	defer s.mut.Unlock()
-	for _, subDir := range subDirectories {
+	for _, subDir := range profileDirs {
 		err := os.RemoveAll(path.Join(dir, subDir))
 		if err != nil {
 			slog.Error("failed to remove directory", "dir", subDir, "err", err)
@@ -390,6 +419,5 @@ func (s *server) CompactNamespace(ctx context.Context, namespace string) error {
 		}
 	}
 
-	log.Printf("compacted %d profiles in namespace %q", len(subDirectories), namespace)
-	return nil
+	return id.String(), nil
 }
