@@ -337,7 +337,7 @@ func (s *server) compactNamespace(ctx context.Context, namespace string, dir str
 }
 
 const jobBranchNum = 8
-const maxProfilesPerJob = 64
+const maxProfilesPerJob = 128
 
 func (s *server) compact(ctx context.Context, dir string, profileDirs []string) (string, error) {
 	if len(profileDirs) == 0 {

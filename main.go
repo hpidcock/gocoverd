@@ -92,7 +92,7 @@ func main() {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(30 * time.Second):
+			case <-time.After(time.Second):
 			}
 			for _, namespace := range s.CompactableNamespaces() {
 				err := s.CompactNamespace(ctx, namespace)
