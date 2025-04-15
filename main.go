@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -62,7 +64,10 @@ func main() {
 		log.Printf("presharedkey=%s", psk)
 	}
 
-	eg, ctx := errgroup.WithContext(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	eg, ctx := errgroup.WithContext(ctx)
 
 	s := newServer(dataDir, []byte(psk))
 
@@ -92,10 +97,15 @@ func main() {
 			for _, namespace := range s.CompactableNamespaces() {
 				err := s.CompactNamespace(ctx, namespace)
 				if err != nil {
-					return err
+					log.Printf("compact namespace %s failed: %v", namespace, err)
 				}
 			}
 		}
+	})
+	eg.Go(func() error {
+		<-ctx.Done()
+		_ = listener.Close()
+		return ctx.Err()
 	})
 	eg.Go(func() error {
 		return httpServer.Serve(listener)
