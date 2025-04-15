@@ -14,7 +14,6 @@ import (
 	"io/fs"
 	"log"
 	"log/slog"
-	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -33,32 +32,27 @@ type server struct {
 
 	cleanupMut sync.Mutex
 
-	mut             sync.Mutex
-	writingProfiles map[uuid.UUID]chan struct{}
-	needsCompact    map[string]int
+	mut          sync.Mutex
+	needsCompact map[string]int
 }
 
 func newServer(dataDir string, psk []byte) *server {
 	closedChan := make(chan struct{})
 	close(closedChan)
 	return &server{
-		psk:             psk,
-		dataDir:         dataDir,
-		dataDirFS:       os.DirFS(dataDir),
-		writingProfiles: make(map[uuid.UUID]chan struct{}),
-		needsCompact:    make(map[string]int),
+		psk:          psk,
+		dataDir:      dataDir,
+		dataDirFS:    os.DirFS(dataDir),
+		needsCompact: make(map[string]int),
 	}
 }
 
-func (s *server) writing(namespaceToCompact string, profile uuid.UUID) func() {
+func (s *server) writing(namespaceToCompact string) func() {
 	s.mut.Lock()
 	defer s.mut.Unlock()
-	s.writingProfiles[profile] = make(chan struct{})
 	return func() {
 		s.mut.Lock()
 		defer s.mut.Unlock()
-		close(s.writingProfiles[profile])
-		delete(s.writingProfiles, profile)
 		if namespaceToCompact != "" {
 			s.needsCompact[namespaceToCompact]++
 		}
@@ -146,10 +140,10 @@ func (s *server) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock := s.writing(namespace, id)
+	unlock := s.writing(namespace)
 	defer unlock()
 
-	dir := path.Join(s.dataDir, namespaceDir, id.String())
+	dir := path.Join(s.dataDir, namespaceDir, ".tmp."+id.String())
 	err = os.Mkdir(dir, 0755)
 	if err != nil {
 		log.Printf("failed to create directory %q: %v", dir, err)
@@ -211,6 +205,14 @@ func (s *server) HandleUpload(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+	}
+
+	finalDir := path.Join(s.dataDir, namespaceDir, id.String())
+	err = os.Rename(dir, finalDir)
+	if err != nil {
+		log.Printf("failed to move directory %q: %v", dir, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	complete = true
 	http.Error(w, "OK", http.StatusOK)
@@ -287,7 +289,6 @@ func (s *server) CompactNamespace(ctx context.Context, namespace string) error {
 func (s *server) compactNamespace(ctx context.Context, namespace string, dir string) (string, error) {
 	s.mut.Lock()
 	delete(s.needsCompact, namespace)
-	writingProfiles := maps.Clone(s.writingProfiles)
 	entries, err := os.ReadDir(dir)
 	s.mut.Unlock()
 	if err != nil {
@@ -300,22 +301,12 @@ func (s *server) compactNamespace(ctx context.Context, namespace string, dir str
 			continue
 		}
 		name := entry.Name()
-		id, err := uuid.Parse(name)
-		if err != nil {
+		if strings.HasPrefix(name, ".tmp.") {
 			continue
 		}
-		if ch, ok := writingProfiles[id]; ok {
-			select {
-			case <-ch:
-			case <-ctx.Done():
-				return "", ctx.Err()
-			}
-			_, err := os.Stat(path.Join(dir, name))
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			} else if err != nil {
-				return "", err
-			}
+		_, err := uuid.Parse(name)
+		if err != nil {
+			continue
 		}
 		profileDirs = append(profileDirs, name)
 	}
@@ -357,10 +348,10 @@ func (s *server) collect(ctx context.Context, dir string, profileDirs []string) 
 		return "", err
 	}
 
-	unlock := s.writing("", id)
+	unlock := s.writing("")
 	defer unlock()
 
-	outDir := path.Join(dir, id.String())
+	outDir := path.Join(dir, ".tmp."+id.String())
 	err = os.Mkdir(outDir, 0755)
 	if err != nil {
 		return "", fmt.Errorf("failed to create directory: %w", err)
@@ -412,6 +403,12 @@ func (s *server) collect(ctx context.Context, dir string, profileDirs []string) 
 			_ = os.RemoveAll(outDir)
 			return "", err
 		}
+	}
+
+	finalDir := path.Join(dir, id.String())
+	err = os.Rename(outDir, finalDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to move directory %q: %w", outDir, err)
 	}
 
 	for _, subDir := range profileDirs {
@@ -483,18 +480,16 @@ func (s *server) collectOne(ctx context.Context, dir string, counters map[string
 	return nil
 }
 
-const maxProfilesPerJob = 2048
-
 func (s *server) compact(ctx context.Context, dir string, profileDir string) (string, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
 		return "", err
 	}
 
-	unlock := s.writing("", id)
+	unlock := s.writing("")
 	defer unlock()
 
-	outDir := path.Join(dir, id.String())
+	outDir := path.Join(dir, ".tmp."+id.String())
 	err = os.Mkdir(outDir, 0755)
 	if err != nil {
 		return "", fmt.Errorf("failed to create directory: %w", err)
@@ -515,6 +510,12 @@ func (s *server) compact(ctx context.Context, dir string, profileDir string) (st
 	if err != nil {
 		os.RemoveAll(outDir)
 		return "", fmt.Errorf("failed to merge coverage data: %w", err)
+	}
+
+	finalDir := path.Join(dir, id.String())
+	err = os.Rename(outDir, finalDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to move directory %q: %w", outDir, err)
 	}
 
 	err = os.RemoveAll(path.Join(dir, profileDir))
